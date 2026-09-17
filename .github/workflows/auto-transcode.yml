@@ -20,7 +20,7 @@ concurrency:
 
 jobs:
   transcode:
-    name: Transcode & Slice AES-128 HLS
+    name: Transcode & Slice AES-128 HLS (720p 4s)
     runs-on: ubuntu-latest
     timeout-minutes: 120
 
@@ -55,8 +55,8 @@ jobs:
           GDRIVE_SERVICE_ACCOUNT_JSON: ${{ secrets.GDRIVE_SERVICE_ACCOUNT_JSON }}
         run: |
           if [ -n "${{ inputs.job_id }}" ]; then
-            echo "🎬 Running single job: ${{ inputs.job_id }}"
-            python3 scripts/transcoder_pipeline.py --job-id "${{ inputs.job_id }}"
+            echo "🎬 Running single job: ${{ inputs.job_id }} for brand: ${{ inputs.brand || 'both' }}"
+            python3 scripts/transcoder_pipeline.py --job-id "${{ inputs.job_id }}" --brand "${{ inputs.brand || 'both' }}"
           else
             echo "⚡ Running batch pending processor for brand: ${{ inputs.brand || 'both' }}"
             python3 scripts/transcoder_pipeline.py --process-pending --brand "${{ inputs.brand || 'both' }}"

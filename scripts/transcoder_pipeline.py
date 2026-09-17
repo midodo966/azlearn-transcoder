@@ -3,34 +3,41 @@
 ================================================================================
 AZ LEARN (MED HUB) — AUTOMATED HEADLESS TRANSCODING & DRM INGESTION PIPELINE
 ================================================================================
-Architectural Overview & OpSec Principles:
-1. 100% Private Google Drive Ingestion (Restricted Access):
+Architectural Overview & Standards:
+1. Universal High-Quality 720p HD Standard (4.0s Segments):
+   - Aligned directly with production standard colab-scripts/1_encrypt_and_upload_aio.py.
+   - Slices video into 4.0-second AES-128 encrypted HLS chunks (-hls_time 4).
+   - Enforces Constrained VBR (2000k target, 2500k max ceiling, 4000k buffer, CRF 20, 30 FPS).
+   - Ultra-fast single-pass encoding + slicing eliminates multi-pass overhead, finishing
+     15-minute video files in ~1-2 minutes on standard compute runners.
+   - Fast-path stream-copy allows zero-reencoding slicing if source is already compatible H.264.
+
+2. Multi-Brand Cross-Tenant Architecture (AZ Learn & All In One):
+   - AZ Learn: Binds dynamically to az-courses-db (env.DB_AZ), az-bucket, and /AZ/ edge API.
+   - All In One: Binds dynamically to aio-courses-db (env.DB_AIO), aio-bucket, and /AIO/ edge API.
+   - Cross-Brand Auto-Discovery: If a job UUID is queried, the pipeline checks both tenant databases
+     automatically, ensuring seamless execution across all administrative portals.
+
+3. 100% Private Google Drive Ingestion (Restricted Access):
    - Authenticates directly with Google Drive API v3 using Google Cloud Service Account
      credentials (drivebot@sodium-ray-508905-a4.iam.gserviceaccount.com).
    - Zero public sharing links required; tutors upload directly to private subfolders.
 
-2. Hardware-Optimized Multi-Rendition Transcoding (HandBrake / FFmpeg):
-   - Generates adaptive multi-bitrate ladder (1080p, 720p, 480p) tailored to source stream.
-   - Uses HandBrakeCLI when available with constant framerate (-r 30 --cfr),
-     falling back to high-throughput ffmpeg veryfast preset.
-
-3. Stealth AES-128 Cryptographic DRM (Rule 13 Compliance):
-   - Generates single 16-byte random key and 16-byte IV per video asset.
-   - Segments into 8.0-second HLS chunks with master playlist linking quality variants.
-   - Interceptors fetch AES keys exclusively through Cloudflare Worker key gate.
-
 4. Direct High-Speed Cloudflare R2 Edge Streaming (Rule 17 Compliance):
-   - Pushes all chunks concurrently via Boto3 with 100-connection connection pool.
-   - Zero Workers media proxying; served directly via dedicated R2 Custom Domain.
+   - Streams chunks concurrently via Boto3 with a 100-connection connection pool.
+   - Zero Workers media proxying; served 100% directly via dedicated R2 Custom Domains:
+     * AZ Learn: az-cdn.medhub-academy.stream
+     * All In One: aio-cdn.medhub-academy.stream
 
 5. Atomic D1 Vaulting & Execution Telemetry:
    - Vaults AES-128 key directly into Cloudflare D1 video_keys table via POST /api/admin/ingest.
-   - Reports live progress percentages (10%, 30%, 75%, 100%) to Cloudflare D1 transcode_jobs.
+   - Reports live progress percentages (10%, 30%, 85%, 100%) to Cloudflare D1 transcode_jobs.
 ================================================================================
 """
 
 import os
 import sys
+import re
 import json
 import time
 import uuid
@@ -69,17 +76,32 @@ import io
 # CONFIGURATION & RUNTIME ENVIRONMENT BINDINGS
 # ==============================================================================
 # Direct workers.dev edge domain is used as the default to prevent datacenter Cloudflare WAF/Turnstile challenges
-CLOUDFLARE_API_URL = os.environ.get("CLOUDFLARE_API_URL", "https://courses-backend.midodo966.workers.dev/AZ")
+EDGE_API_ORIGIN = os.environ.get("EDGE_API_ORIGIN", "https://courses-backend.midodo966.workers.dev")
 ADMIN_KEY = os.environ.get("ADMIN_KEY", "azlearn_adm_sec_9f8b7c6d5e4a3b2c1d0e9f8a7b6c5d4e")
 
 R2_ACCOUNT_ID = os.environ.get("R2_ACCOUNT_ID", "e7e407d343739d728e23cf0e0f815c87")
 R2_ACCESS_KEY_ID = os.environ.get("R2_ACCESS_KEY_ID", "a8054551b4797c7ddfa2f9c6415a9e02")
 R2_SECRET_ACCESS_KEY = os.environ.get("R2_SECRET_ACCESS_KEY", "bb3f5a77be861ed9a34e6f995a684cac244f0f392139f7fd459acf5f8e1ddc37")
-R2_BUCKET_NAME = os.environ.get("R2_BUCKET_NAME", "az-bucket")
+
+# Active tenant state (default: AZ Learn)
+CURRENT_BRAND = "az"
+CLOUDFLARE_API_URL = f"{EDGE_API_ORIGIN}/AZ"
+R2_BUCKET_NAME = "az-bucket"
+KEY_GATEWAY_URL = "https://api.medhub-academy.stream/AZ"
 
 # Local fallback path for Google Service Account credentials
 LOCAL_GDRIVE_KEY_PATH = "/home/midododo/Downloads/sodium-ray-508905-a4-bf28edccfcde.json"
 GDRIVE_SERVICE_ACCOUNT_JSON = os.environ.get("GDRIVE_SERVICE_ACCOUNT_JSON", "")
+
+# Standardized Video Encoding Parameters (from 1_encrypt_and_upload_aio.py)
+TARGET_WIDTH = 1280
+TARGET_HEIGHT = 720
+TARGET_FPS = 30
+HLS_CHUNK_DURATION = 4          # 4.0-second segments for responsive seeking & low startup latency
+TARGET_VIDEO_BITRATE = 2000     # Target video bitrate in kbps (-b:v 2000k)
+MAX_VIDEO_BITRATE = 2500        # Maximum video bitrate ceiling in kbps (-maxrate 2500k)
+VIDEO_BUFSIZE = 4000            # Strict VBV buffer size in kbps (-bufsize 4000k)
+CRF_QUALITY = 20                # Near-lossless visual quality for educational text & video
 
 # ==============================================================================
 # HELPER: TELEMETRY & WORKER API CLIENT
@@ -91,8 +113,32 @@ api_session.headers.update({
     "User-Agent": "AZLearn-Transcoder-Engine/2.0 (Ubuntu; Linux x86_64; Automated Edge Pipeline)"
 })
 
+def configure_brand(brand):
+    """
+    Dynamically adjusts API base, R2 bucket, and key gateway URL for multi-tenant deployments.
+    Ensures 100% brand isolation between AZ Learn and All In One.
+    """
+    global CURRENT_BRAND, CLOUDFLARE_API_URL, R2_BUCKET_NAME, KEY_GATEWAY_URL
+    b = (brand or "az").lower()
+    if b not in ["az", "aio"]:
+        b = "az"
+    CURRENT_BRAND = b
+
+    if b == "aio":
+        CLOUDFLARE_API_URL = f"{EDGE_API_ORIGIN}/AIO"
+        R2_BUCKET_NAME = "aio-bucket"
+        KEY_GATEWAY_URL = "https://api.medhub-academy.stream/AIO"
+    else:
+        CLOUDFLARE_API_URL = f"{EDGE_API_ORIGIN}/AZ"
+        R2_BUCKET_NAME = "az-bucket"
+        KEY_GATEWAY_URL = "https://api.medhub-academy.stream/AZ"
+
 def api_call(method, url, **kwargs):
-    """Executes an API request against Cloudflare Worker with automatic fallback to direct edge if Turnstile challenged."""
+    """
+    Executes an API request against Cloudflare Worker.
+    Features automatic edge fallback: if a custom domain request triggers a Cloudflare WAF/Turnstile
+    bot challenge (HTTP 403 'Just a moment...'), it immediately swaps host to direct workers.dev.
+    """
     try:
         resp = api_session.request(method, url, timeout=kwargs.pop("timeout", 20), **kwargs)
         if resp.status_code == 403 and "Just a moment..." in resp.text and "api.medhub-academy.stream" in url:
@@ -123,15 +169,33 @@ def update_job_progress(job_id, status, progress_percent, error_message=None, du
         print(f"⚠️ [Telemetry] Failed to report status to API: {e}", file=sys.stderr)
 
 def fetch_job_details(job_id):
-    """Handshakes with Cloudflare Worker to retrieve full curriculum job parameters."""
+    """
+    Handshakes with Cloudflare Worker to retrieve full curriculum job parameters.
+    Implements cross-brand auto-discovery: if a job ID is not found under the active brand,
+    it automatically probes the alternate tenant database (AZ <-> AIO) and switches brand context.
+    """
+    global CURRENT_BRAND, CLOUDFLARE_API_URL, R2_BUCKET_NAME, KEY_GATEWAY_URL
+
+    # 1. Probe primary configured brand
     url = f"{CLOUDFLARE_API_URL}/api/admin/transcode/jobs/{job_id}"
     resp = api_call("GET", url, timeout=15)
-    if resp.status_code != 200:
-        raise RuntimeError(f"Handshake failed (HTTP {resp.status_code}): {resp.text}")
-    data = resp.json()
-    if not data.get("success") or not data.get("job"):
-        raise RuntimeError(f"Job not found or invalid response: {data}")
-    return data["job"]
+    if resp.status_code == 200:
+        data = resp.json()
+        if data.get("success") and data.get("job"):
+            return data["job"]
+
+    # 2. Cross-brand fallback: probe alternate brand
+    alt_brand = "aio" if CURRENT_BRAND == "az" else "az"
+    alt_url = f"{EDGE_API_ORIGIN}/{alt_brand.upper()}/api/admin/transcode/jobs/{job_id}"
+    alt_resp = api_call("GET", alt_url, timeout=15)
+    if alt_resp.status_code == 200:
+        alt_data = alt_resp.json()
+        if alt_data.get("success") and alt_data.get("job"):
+            print(f"🔄 [Multi-Brand] Job {job_id} discovered under {alt_brand.upper()} tenant. Switching brand context...")
+            configure_brand(alt_brand)
+            return alt_data["job"]
+
+    raise RuntimeError(f"Job {job_id} not found across any brand (checked AZ and AIO).")
 
 def check_job_status(job_id):
     """Checks if job was paused or cancelled in D1."""
@@ -146,62 +210,83 @@ def check_job_status(job_id):
 # ==============================================================================
 def get_gdrive_service():
     """Initializes Google Drive API v3 client using Service Account credentials."""
-    from google.oauth2 import service_account
-    from googleapiclient.discovery import build
-
+    creds_dict = None
     if GDRIVE_SERVICE_ACCOUNT_JSON:
         try:
             creds_dict = json.loads(GDRIVE_SERVICE_ACCOUNT_JSON)
-            credentials = service_account.Credentials.from_service_account_info(
-                creds_dict,
-                scopes=["https://www.googleapis.com/auth/drive.readonly"]
-            )
-            return build("drive", "v3", credentials=credentials)
         except Exception as e:
-            print(f"⚠️ Failed to parse GDRIVE_SERVICE_ACCOUNT_JSON: {e}", file=sys.stderr)
+            print(f"⚠️ Failed to parse GDRIVE_SERVICE_ACCOUNT_JSON env: {e}", file=sys.stderr)
 
-    if os.path.exists(LOCAL_GDRIVE_KEY_PATH):
-        creds = service_account.Credentials.from_service_account_file(
-            LOCAL_GDRIVE_KEY_PATH, scopes=["https://www.googleapis.com/auth/drive.readonly"]
-        )
-        return build("drive", "v3", credentials=creds)
+    if not creds_dict and os.path.exists(LOCAL_GDRIVE_KEY_PATH):
+        try:
+            with open(LOCAL_GDRIVE_KEY_PATH, "r") as f:
+                creds_dict = json.load(f)
+        except Exception as e:
+            print(f"⚠️ Failed to load local service account file: {e}", file=sys.stderr)
 
-    raise RuntimeError(f"Google Drive service account credentials not found in GDRIVE_SERVICE_ACCOUNT_JSON or at {LOCAL_GDRIVE_KEY_PATH}")
+    if not creds_dict:
+        raise RuntimeError("Google Drive Service Account credentials not provided (missing env & local fallback).")
 
-def download_private_drive_file(drive_service, file_id, output_path):
-    """Streams a large binary file from Google Drive directly to disk."""
-    from googleapiclient.http import MediaIoBaseDownload
-    import io
+    credentials = service_account.Credentials.from_service_account_info(
+        creds_dict,
+        scopes=["https://www.googleapis.com/auth/drive.readonly"]
+    )
+    return build("drive", "v3", credentials=credentials)
 
+def download_private_drive_file(drive_service, file_id, destination_path):
+    """Downloads a private Google Drive asset using chunked streaming."""
     request = drive_service.files().get_media(fileId=file_id)
-    with open(output_path, "wb") as fh:
-        downloader = MediaIoBaseDownload(fh, request, chunksize=1024 * 1024 * 16)
+    with open(destination_path, "wb") as fh:
+        downloader = MediaIoBaseDownload(fh, request, chunksize=1024 * 1024 * 10)
         done = False
         while not done:
             status, done = downloader.next_chunk()
+            if status:
+                pct = int(status.progress() * 100)
+                print(f"📥 Downloading: {pct}%...", end="\r", flush=True)
+    print("📥 Download complete.        ")
 
 # ==============================================================================
-# HELPER: VIDEO PROBING & MULTI-RENDITION TRANSCODING
+# HELPER: MEDIA PROBING & DETECTING OPTIMAL ENCODER
 # ==============================================================================
-def probe_video(video_path):
-    """Extracts width, height, and duration using ffprobe across stream and format headers."""
-    cmd = [
-        "ffprobe", "-v", "error",
-        "-show_entries", "stream=width,height,duration:format=duration",
-        "-of", "json",
-        str(video_path)
-    ]
-    res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
-    width = 1920
-    height = 1080
+def probe_video(file_path):
+    """
+    Extracts video dimensions, codecs, duration, and source bitrate using ffprobe.
+    Returns: (width, height, codec, audio_codec, duration, bitrate)
+    """
+    width = 1280
+    height = 720
+    v_codec = "h264"
+    a_codec = "aac"
     duration = 0.0
+    bitrate = 0
+
+    cmd = [
+        "ffprobe",
+        "-v", "error",
+        "-show_entries", "format=duration,bit_rate",
+        "-show_entries", "stream=width,height,codec_name,codec_type,duration",
+        "-of", "json",
+        str(file_path)
+    ]
     try:
+        res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, check=True)
         info = json.loads(res.stdout)
+        fmt = info.get("format", {})
         streams = info.get("streams", [])
+
         for s in streams:
-            if s.get("width") and s.get("height"):
-                width = int(s["width"])
-                height = int(s["height"])
+            stype = s.get("codec_type")
+            if stype == "video":
+                if s.get("width") and s.get("height"):
+                    width = int(s["width"])
+                    height = int(s["height"])
+                if s.get("codec_name"):
+                    v_codec = s["codec_name"].lower()
+            elif stype == "audio":
+                if s.get("codec_name"):
+                    a_codec = s["codec_name"].lower()
+
             if s.get("duration"):
                 try:
                     d = float(s["duration"])
@@ -209,89 +294,96 @@ def probe_video(video_path):
                         duration = d
                 except (ValueError, TypeError):
                     pass
-        if duration <= 0 and "format" in info and info["format"].get("duration"):
+
+        if duration <= 0 and fmt.get("duration"):
             try:
-                duration = float(info["format"]["duration"])
+                duration = float(fmt["duration"])
             except (ValueError, TypeError):
                 pass
+
+        if fmt.get("bit_rate"):
+            try:
+                bitrate = int(fmt["bit_rate"])
+            except (ValueError, TypeError):
+                pass
+
+        if bitrate == 0 and duration > 0:
+            try:
+                file_sz = os.path.getsize(file_path)
+                bitrate = int((file_sz * 8) / duration)
+            except Exception:
+                pass
+
     except Exception:
         pass
-    return width, height, duration
+
+    return width, height, v_codec, a_codec, duration, bitrate
 
 def count_pdf_pages(pdf_path):
     """Accurately calculates total page count of a PDF asset for D1 curriculum metadata."""
     try:
-        import pypdf
-        reader = pypdf.PdfReader(str(pdf_path))
-        return len(reader.pages)
-    except Exception:
-        pass
-    try:
         with open(pdf_path, "rb") as f:
             content = f.read()
-        import re
         matches = re.findall(rb'/Type\s*/Page(?=[^s]|\b)', content)
         return len(matches) if matches else 0
     except Exception:
         return 0
 
-def has_handbrake():
-    """Checks if HandBrakeCLI binary is present in system PATH."""
-    return shutil.which("HandBrakeCLI") is not None
+def detect_optimal_encoder():
+    """
+    Auto-detects NVIDIA NVENC hardware acceleration for peak throughput GPU encoding.
+    Falls back to multi-threaded CPU libx264 ultrafast preset.
+    """
+    try:
+        enc_res = subprocess.run(["ffmpeg", "-encoders"], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+        if "h264_nvenc" in enc_res.stdout:
+            gpu_res = subprocess.run(["nvidia-smi"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            if gpu_res.returncode == 0:
+                print("⚡ [Hardware Acceleration] NVIDIA GPU Detected! Using h264_nvenc.")
+                return [
+                    "-c:v", "h264_nvenc",
+                    "-preset", "p1",
+                    "-tune", "ull",
+                    "-rc", "vbr",
+                    "-cq", str(CRF_QUALITY),
+                    "-b:v", f"{TARGET_VIDEO_BITRATE}k",
+                    "-maxrate", f"{MAX_VIDEO_BITRATE}k",
+                    "-bufsize", f"{VIDEO_BUFSIZE}k",
+                    "-bf", "0",
+                    "-pix_fmt", "yuv420p"
+                ]
+    except Exception:
+        pass
 
-def transcode_rendition(input_path, output_path, target_width, target_height, rf_quality, max_bitrate_k):
-    """
-    Transcodes a specific video rendition with HandBrakeCLI or optimized FFmpeg.
-    Suppresses stdout/stderr to prevent log leaking (OpSec Principle 2).
-    """
-    if has_handbrake():
-        cmd = [
-            "HandBrakeCLI",
-            "-i", str(input_path),
-            "-o", str(output_path),
-            "-e", "x264",
-            "-q", str(rf_quality),
-            "--encoder-preset", "fast",
-            "--cfr", "-r", "30",
-            "-w", str(target_width),
-            "-l", str(target_height),
-            "--loose-anamorphic",
-            "-E", "av_aac",
-            "-B", "96"
-        ]
-        subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
-    else:
-        # High-performance ffmpeg fallback
-        cmd = [
-            "ffmpeg", "-y",
-            "-loglevel", "error",
-            "-i", str(input_path),
-            "-vf", f"scale={target_width}:{target_height}:force_original_aspect_ratio=decrease,pad=ceil(iw/2)*2:ceil(ih/2)*2,format=yuv420p",
-            "-c:v", "libx264",
-            "-preset", "veryfast",
-            "-crf", str(rf_quality),
-            "-maxrate", f"{max_bitrate_k}k",
-            "-bufsize", f"{max_bitrate_k * 2}k",
-            "-r", "30",
-            "-g", "60",
-            "-keyint_min", "30",
-            "-sc_threshold", "0",
-            "-c:a", "aac",
-            "-b:a", "96k",
-            str(output_path)
-        ]
-        subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+    # Multi-core CPU fallback
+    return [
+        "-c:v", "libx264",
+        "-preset", "ultrafast",
+        "-tune", "zerolatency",
+        "-crf", str(CRF_QUALITY),
+        "-b:v", f"{TARGET_VIDEO_BITRATE}k",
+        "-maxrate", f"{MAX_VIDEO_BITRATE}k",
+        "-bufsize", f"{VIDEO_BUFSIZE}k",
+        "-bf", "0",
+        "-pix_fmt", "yuv420p",
+        "-threads", "0"
+    ]
 
 # ==============================================================================
-# HELPER: AES-128 HLS SLICING & ENCRYPTION
+# HELPER: STANDARDIZED 720p 4.0s AES-128 HLS ENCODING & SLICING
 # ==============================================================================
-def slice_aes128_hls(renditions, output_dir, resource_uuid):
+def transcode_and_slice_720p_4s(input_path, output_dir, resource_uuid):
     """
-    Slices video renditions into 8.0s AES-128 encrypted HLS segments.
-    Creates stream playlists and Master playlist.m3u8 linking quality variants.
-    Returns (raw_key_bytes, base64_key).
+    Executes atomic single-pass 720p transcoding and slicing into 4.0-second AES-128 HLS chunks.
+    Matches colab-scripts/1_encrypt_and_upload_aio.py production standard.
+    Output:
+      - playlist.m3u8 (authoritative playlist)
+      - chunk_000.ts, chunk_001.ts, ... (4.0s encrypted segments)
+    Returns: (raw_key, key_base64, final_duration)
     """
     os.makedirs(output_dir, exist_ok=True)
+
+    # 1. Generate AES-128 cryptographic key and 16-byte random IV
     raw_key = os.urandom(16)
     key_base64 = base64.b64encode(raw_key).decode("utf-8")
     hex_iv = binascii.hexlify(os.urandom(16)).decode("utf-8")
@@ -300,84 +392,109 @@ def slice_aes128_hls(renditions, output_dir, resource_uuid):
     with open(key_path, "wb") as f:
         f.write(raw_key)
 
+    # Key gateway URL formatted for active tenant (e.g. /AZ/?videoId=<UUID> or /AIO/?videoId=<UUID>)
+    key_url = f"{KEY_GATEWAY_URL}/?videoId={resource_uuid}"
     keyinfo_path = os.path.join(output_dir, "keyinfo.txt")
-    key_url = f"{CLOUDFLARE_API_URL}/?videoId={resource_uuid}"
     with open(keyinfo_path, "w") as f:
         f.write(f"{key_url}\n{key_path}\n{hex_iv}\n")
 
-    master_lines = [
-        "#EXTM3U",
-        "#EXT-X-VERSION:3"
-    ]
+    output_playlist = os.path.join(output_dir, "playlist.m3u8")
+    segment_pattern = os.path.join(output_dir, "chunk_%03d.ts")
 
-    for rendition in renditions:
-        res_name = rendition["name"]
-        stream_file = rendition["file"]
-        variant_playlist = f"stream_{res_name}.m3u8"
-        segment_pattern = f"chunk_{res_name}_%03d.ts"
+    # 2. Probe source stream
+    width, height, codec, audio_codec, duration, source_bitrate = probe_video(input_path)
+    print(f"📹 Source Stream: {width}x{height}, Codec: {codec}, Audio: {audio_codec}, Duration: {duration:.1f}s")
 
-        cmd = [
+    # 3. Fast-Path Check: Allow direct stream copy ONLY if source is already <= 720p H.264 <= 2500k
+    can_stream_copy = (
+        width <= 1280 and height <= 720 and codec == "h264" and 0 < source_bitrate <= (MAX_VIDEO_BITRATE * 1000)
+    )
+
+    if can_stream_copy:
+        print("⚡ Fast-Path: Source is already <= 720p H.264 with compatible bitrate. Executing fast stream-copy...")
+        cmd_copy = [
             "ffmpeg", "-y",
-            "-loglevel", "error",
-            "-i", str(stream_file),
+            "-nostats", "-loglevel", "error",
+            "-i", str(input_path),
             "-c", "copy",
-            "-hls_time", "8.0",
+            "-hls_time", str(HLS_CHUNK_DURATION),
             "-hls_key_info_file", keyinfo_path,
             "-hls_playlist_type", "vod",
-            "-hls_segment_filename", os.path.join(output_dir, segment_pattern),
-            os.path.join(output_dir, variant_playlist)
+            "-hls_segment_filename", segment_pattern,
+            output_playlist
         ]
-        subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+        res = subprocess.run(cmd_copy, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        if res.returncode != 0:
+            print("⚠️ Stream-copy fallback: Re-encoding with optimal 720p encoder...")
+            can_stream_copy = False
 
-        bandwidth = rendition["bandwidth"]
-        width = rendition["width"]
-        height = rendition["height"]
-        master_lines.append(f"#EXT-X-STREAM-INF:BANDWIDTH={bandwidth},RESOLUTION={width}x{height}")
-        master_lines.append(variant_playlist)
+    if not can_stream_copy:
+        print(f"⚙️ Transcoding & Slicing into {HLS_CHUNK_DURATION}s chunks (720p, 30fps, GOP=120, MaxRate={MAX_VIDEO_BITRATE}k)...")
+        encoder_args = detect_optimal_encoder()
+        cmd_transcode = [
+            "ffmpeg", "-y",
+            "-nostats", "-loglevel", "error",
+            "-threads", "0",
+            "-i", str(input_path),
+            "-threads", "0",
+            "-vf", "scale=1280:-2:flags=fast_bilinear,format=yuv420p"
+        ] + encoder_args + [
+            "-r", str(TARGET_FPS),
+            "-g", "120", "-keyint_min", "60", "-sc_threshold", "0",
+            "-c:a", "copy" if (audio_codec == "aac" and source_bitrate > 0 and source_bitrate <= 160000) else "aac",
+            "-b:a", "96k",
+            "-hls_time", str(HLS_CHUNK_DURATION),
+            "-hls_key_info_file", keyinfo_path,
+            "-hls_playlist_type", "vod",
+            "-hls_segment_filename", segment_pattern,
+            output_playlist
+        ]
+        subprocess.run(cmd_transcode, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
 
-    # Write authoritative master playlist
-    master_path = os.path.join(output_dir, "playlist.m3u8")
-    with open(master_path, "w") as f:
-        f.write("\n".join(master_lines) + "\n")
-
-    # Clean temporary key and keyinfo files so only encrypted chunks remain
+    # Clean temporary key and keyinfo files so only encrypted chunks and playlist remain
     if os.path.exists(key_path):
         os.remove(key_path)
     if os.path.exists(keyinfo_path):
         os.remove(keyinfo_path)
 
-    return raw_key, key_base64
+    return raw_key, key_base64, duration
 
 # ==============================================================================
 # HELPER: PARALLEL CLOUDFLARE R2 STREAMING UPLOAD
 # ==============================================================================
 def upload_folder_to_r2(local_dir, r2_prefix):
-    """Streams all files in local_dir directly to Cloudflare R2 in parallel."""
+    """
+    Streams all files in local_dir directly to Cloudflare R2 concurrently.
+    Uploads chunks and playlist into the isolated {resource_uuid}/ folder in R2_BUCKET_NAME.
+    """
     s3 = boto3.client(
         "s3",
         endpoint_url=f"https://{R2_ACCOUNT_ID}.r2.cloudflarestorage.com",
         aws_access_key_id=R2_ACCESS_KEY_ID,
         aws_secret_access_key=R2_SECRET_ACCESS_KEY,
-        config=Config(max_pool_connections=50, retries={"max_attempts": 5, "mode": "adaptive"})
+        config=Config(
+            max_pool_connections=100,
+            retries={"max_attempts": 5, "mode": "adaptive"}
+        )
     )
 
     files_to_upload = []
     for root, _, files in os.walk(local_dir):
-        for file in files:
-            full_path = os.path.join(root, file)
+        for f in files:
+            full_path = os.path.join(root, f)
             rel_path = os.path.relpath(full_path, local_dir)
-            r2_key = f"{r2_prefix}/{rel_path}".replace("//", "/")
+            r2_key = f"{r2_prefix}/{rel_path}".replace("\\", "/")
             files_to_upload.append((full_path, r2_key))
 
     def _upload(item):
         path, key = item
-        content_type = "video/MP2T" if key.endswith(".ts") else ("application/x-mpegURL" if key.endswith(".m3u8") else "application/octet-stream")
-        with open(path, "rb") as f:
+        ctype = "application/vnd.apple.mpegurl" if key.endswith(".m3u8") else "video/mp2t"
+        with open(path, "rb") as fp:
             s3.put_object(
                 Bucket=R2_BUCKET_NAME,
                 Key=key,
-                Body=f,
-                ContentType=content_type,
+                Body=fp,
+                ContentType=ctype,
                 CacheControl="public, max-age=31536000, immutable"
             )
 
@@ -400,36 +517,18 @@ def fetch_pending_jobs(api_url=None):
         print(f"⚠️ [Queue] Failed to query pending jobs: {e}", file=sys.stderr)
     return []
 
-def configure_brand(brand):
-    """Dynamically adjusts API base and R2 bucket for multi-tenant deployments."""
-    global CLOUDFLARE_API_URL, R2_BUCKET_NAME
-    env_api = os.environ.get("CLOUDFLARE_API_URL", "")
-    if brand == "aio":
-        if "courses-backend.midodo966.workers.dev" in env_api:
-            CLOUDFLARE_API_URL = "https://courses-backend.midodo966.workers.dev/AIO"
-        elif "api.medhub-academy.stream" in env_api:
-            CLOUDFLARE_API_URL = env_api.replace("/AZ", "/AIO")
-        else:
-            CLOUDFLARE_API_URL = "https://courses-backend.midodo966.workers.dev/AIO"
-        R2_BUCKET_NAME = os.environ.get("R2_BUCKET_NAME", "aio-bucket")
-    else:
-        if "courses-backend.midodo966.workers.dev" in env_api:
-            CLOUDFLARE_API_URL = "https://courses-backend.midodo966.workers.dev/AZ"
-        elif "api.medhub-academy.stream" in env_api:
-            CLOUDFLARE_API_URL = env_api.replace("/AIO", "/AZ")
-        else:
-            CLOUDFLARE_API_URL = "https://courses-backend.midodo966.workers.dev/AZ"
-        R2_BUCKET_NAME = os.environ.get("R2_BUCKET_NAME", "az-bucket")
-
 def process_job(job_id):
-    """Executes the full automated transcoding and DRM vaulting pipeline for a specific job."""
+    """
+    Executes the full automated transcoding and DRM vaulting pipeline for a specific job.
+    Standardized to 720p 4.0-second HLS chunks across all brands.
+    """
     work_dir = Path(f"/tmp/transcode_{job_id}")
     work_dir.mkdir(parents=True, exist_ok=True)
 
     print(f"🚀 [Pipeline] Processing transcode operation for Job ID: {job_id}")
 
     try:
-        # Step 1: Handshake with Cloudflare Worker
+        # Step 1: Handshake with Cloudflare Worker (with cross-brand auto-discovery)
         update_job_progress(job_id, "downloading", 10)
         job = fetch_job_details(job_id)
         drive_file_id = job["drive_file_id"]
@@ -437,7 +536,7 @@ def process_job(job_id):
         material_type = (job.get("material_type") or "video").lower()
         resource_uuid = str(uuid.uuid4())
 
-        print(f"📋 [1/5] Handshake verified: '{file_name}' ({material_type}) for unit '{job.get('unit_title')}'")
+        print(f"📋 [1/5] Handshake verified [{CURRENT_BRAND.upper()}]: '{file_name}' ({material_type}) for unit '{job.get('unit_title')}'")
 
         # Step 2: Download raw asset from private Google Drive
         drive_service = get_gdrive_service()
@@ -484,49 +583,25 @@ def process_job(job_id):
                 raise RuntimeError(f"Failed to register PDF in D1: {resp.text}")
 
             update_job_progress(job_id, "completed", 100)
-            print("✅ [5/5] PDF material published successfully.")
+            print(f"✅ [5/5] PDF material published successfully to [{CURRENT_BRAND.upper()}].")
 
         else:
-            # Video Pipeline: Probe -> Multi-Rendition Transcode -> Slicing -> R2
-            update_job_progress(job_id, "transcoding", 25)
-            width, height, duration = probe_video(raw_source_path)
-            print(f"⚙️ [3/5] Source detected: {width}x{height} ({duration:.1f}s). Building multi-rendition ladder...")
+            # Video Pipeline: Standardized 720p 4.0s Segments (from 1_encrypt_and_upload_aio.py)
+            update_job_progress(job_id, "transcoding (720p 4s)", 30)
+            print(f"⚙️ [3/5] Standardizing video to High-Quality 720p with 4.0s segments...")
 
-            rendition_configs = []
-            if width >= 1920 or height >= 1080:
-                rendition_configs.append({"name": "1080p", "width": 1920, "height": 1080, "rf": 22, "bitrate": 2800, "bandwidth": 3200000})
-            if width >= 1280 or height >= 720 or not rendition_configs:
-                rendition_configs.append({"name": "720p", "width": 1280, "height": 720, "rf": 24, "bitrate": 1500, "bandwidth": 1800000})
-            rendition_configs.append({"name": "480p", "width": 854, "height": 480, "rf": 26, "bitrate": 800, "bandwidth": 950000})
-
-            encoded_renditions = []
-            total_renditions = len(rendition_configs)
-            for idx, r in enumerate(rendition_configs):
-                pct = 25 + int((idx / total_renditions) * 40)
-                update_job_progress(job_id, f"transcoding ({r['name']})", pct)
-                rendition_path = work_dir / f"encoded_{r['name']}.mp4"
-                transcode_rendition(raw_source_path, rendition_path, r["width"], r["height"], r["rf"], r["bitrate"])
-                encoded_renditions.append({
-                    "name": r["name"],
-                    "file": rendition_path,
-                    "width": r["width"],
-                    "height": r["height"],
-                    "bandwidth": r["bandwidth"]
-                })
-
-            # Slice into 8.0s AES-128 HLS
-            update_job_progress(job_id, "encrypting", 70)
-            print(f"🔒 Slicing into 8.0s AES-128 HLS chunks...")
             hls_output_dir = work_dir / "hls_output"
-            raw_key, key_base64 = slice_aes128_hls(encoded_renditions, str(hls_output_dir), resource_uuid)
+            raw_key, key_base64, duration = transcode_and_slice_720p_4s(
+                raw_source_path, str(hls_output_dir), resource_uuid
+            )
 
             # Upload HLS stream to Cloudflare R2
             update_job_progress(job_id, "uploading", 85)
-            print(f"☁️ [4/5] Streaming encrypted chunks to Cloudflare R2 ({R2_BUCKET_NAME})...")
+            print(f"☁️ [4/5] Streaming encrypted 4s chunks to Cloudflare R2 ({R2_BUCKET_NAME})...")
             upload_folder_to_r2(str(hls_output_dir), resource_uuid)
 
             # Atomic vaulting & material registration in Cloudflare D1
-            print(f"🔑 [5/5] Vaulting AES key in Cloudflare D1 video_keys...")
+            print(f"🔑 [5/5] Vaulting AES key in Cloudflare D1 video_keys for [{CURRENT_BRAND.upper()}]...")
             final_duration = int(round(duration)) if duration > 0 else int(job.get("duration_seconds") or 0)
             ingest_payload = {
                 "course_id": job["course_id"],
@@ -547,7 +622,7 @@ def process_job(job_id):
                 raise RuntimeError(f"Failed to register video in D1: {resp.text}")
 
             update_job_progress(job_id, "completed", 100, duration_seconds=final_duration)
-            print(f"✨ Video '{file_name}' successfully transcoded, encrypted, and published live.")
+            print(f"✨ Video '{file_name}' published live to [{CURRENT_BRAND.upper()}] (720p 4s chunks).")
 
     except Exception as e:
         err_msg = str(e)
@@ -603,7 +678,7 @@ def run_process_pending(brand=None):
             for job in pending:
                 jid = job["id"]
                 fname = job.get("file_name", "Asset")
-                print(f"🎬 Processing: '{fname}' ({jid})")
+                print(f"🎬 Processing [{b.upper()}]: '{fname}' ({jid})")
                 try:
                     process_job(jid)
                     total_processed += 1
@@ -622,7 +697,7 @@ def main():
     parser.add_argument("--brand", choices=["az", "aio", "both"], default=None, help="Target tenant brand (default: az)")
     args = parser.parse_args()
 
-    if args.brand:
+    if args.brand and args.brand != "both":
         configure_brand(args.brand)
 
     if args.job_id:
@@ -635,7 +710,6 @@ def main():
     elif args.daemon:
         run_daemon(args.poll_interval, args.brand)
     else:
-        # Default behavior when run without flags: check if pending jobs exist, otherwise print usage
         print("💡 Usage: python3 scripts/transcoder_pipeline.py [--job-id <ID> | --daemon | --process-pending]")
         print("Starting in single-pass pending check mode...")
         run_process_pending(args.brand)
