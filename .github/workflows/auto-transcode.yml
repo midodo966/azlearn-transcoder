@@ -42,7 +42,7 @@ jobs:
       - name: 4. Install Python Dependencies
         run: |
           python3 -m pip install --upgrade pip
-          pip install boto3 requests google-api-python-client google-auth cryptography
+          pip install -r requirements.txt
 
       - name: 5. Execute Transcoding Pipeline
         env:
