@@ -1,0 +1,71 @@
+name: Automated DRM Video Transcoding Pipeline
+
+on:
+  workflow_dispatch:
+    inputs:
+      job_id:
+        description: 'Cloudflare D1 Transcoding Job UUID (Leave blank for all pending)'
+        required: false
+        type: string
+        default: ''
+      brand:
+        description: 'Target Tenant Brand (az, aio, or both)'
+        required: false
+        type: string
+        default: 'both'
+
+concurrency:
+  group: transcode-${{ inputs.job_id != '' && inputs.job_id || 'batch' }}
+  cancel-in-progress: false
+
+jobs:
+  transcode:
+    name: Transcode & Slice AES-128 HLS
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    steps:
+      - name: 1. Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: 2. Setup Python 3.11 Environment
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: 3. Install FFmpeg
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ffmpeg
+
+      - name: 4. Install Python Dependencies
+        run: |
+          python3 -m pip install --upgrade pip
+          pip install boto3 requests google-api-python-client google-auth cryptography
+
+      - name: 5. Execute Transcoding Pipeline
+        env:
+          CLOUDFLARE_API_URL: ${{ secrets.CLOUDFLARE_API_URL || 'https://api.medhub-academy.stream/AZ' }}
+          ADMIN_KEY: ${{ secrets.ADMIN_KEY }}
+          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_BUCKET_NAME: ${{ secrets.R2_BUCKET_NAME || 'az-bucket' }}
+          GDRIVE_SERVICE_ACCOUNT_JSON: ${{ secrets.GDRIVE_SERVICE_ACCOUNT_JSON }}
+        run: |
+          if [ -n "${{ inputs.job_id }}" ]; then
+            echo "🎬 Running single job: ${{ inputs.job_id }}"
+            python3 scripts/transcoder_pipeline.py --job-id "${{ inputs.job_id }}"
+          else
+            echo "⚡ Running batch pending processor for brand: ${{ inputs.brand || 'both' }}"
+            python3 scripts/transcoder_pipeline.py --process-pending --brand "${{ inputs.brand || 'both' }}"
+          fi
+
+      - name: 6. Purge Execution Run Log (OpSec Mitigation)
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GH_LOG_PURGE_TOKEN || github.token }}
+        run: |
+          echo "Purging workflow execution run log..."
+          gh run delete ${{ github.run_id }} --repo ${{ github.repository }} || true
