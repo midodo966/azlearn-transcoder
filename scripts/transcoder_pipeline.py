@@ -5,7 +5,7 @@ AZ LEARN (MED HUB) — AUTOMATED HEADLESS TRANSCODING & DRM INGESTION PIPELINE
 ================================================================================
 Architectural Overview & Standards:
 1. Universal High-Quality 720p HD Standard (4.0s Segments):
-   - Aligned directly with production standard colab-scripts/1_encrypt_and_upload_aio.py.
+   - Standardized production profile for high seek responsiveness and ultra-low startup latency.
    - Slices video into 4.0-second AES-128 encrypted HLS chunks (-hls_time 4).
    - Enforces Constrained VBR (2000k target, 2500k max ceiling, 4000k buffer, CRF 20, 30 FPS).
    - Ultra-fast single-pass encoding + slicing eliminates multi-pass overhead, finishing
@@ -19,15 +19,12 @@ Architectural Overview & Standards:
      automatically, ensuring seamless execution across all administrative portals.
 
 3. 100% Private Google Drive Ingestion (Restricted Access):
-   - Authenticates directly with Google Drive API v3 using Google Cloud Service Account
-     credentials (drivebot@sodium-ray-508905-a4.iam.gserviceaccount.com).
+   - Authenticates directly with Google Drive API v3 using Google Cloud Service Account credentials.
    - Zero public sharing links required; tutors upload directly to private subfolders.
 
 4. Direct High-Speed Cloudflare R2 Edge Streaming (Rule 17 Compliance):
    - Streams chunks concurrently via Boto3 with a 100-connection connection pool.
-   - Zero Workers media proxying; served 100% directly via dedicated R2 Custom Domains:
-     * AZ Learn: az-cdn.medhub-academy.stream
-     * All In One: aio-cdn.medhub-academy.stream
+   - Zero Workers media proxying; served 100% directly via dedicated R2 Custom Domains.
 
 5. Atomic D1 Vaulting & Execution Telemetry:
    - Vaults AES-128 key directly into Cloudflare D1 video_keys table via POST /api/admin/ingest.
@@ -73,25 +70,24 @@ from googleapiclient.http import MediaIoBaseDownload
 import io
 
 # ==============================================================================
-# CONFIGURATION & RUNTIME ENVIRONMENT BINDINGS
+# CONFIGURATION & RUNTIME ENVIRONMENT BINDINGS (ZERO HARDCODED SECRETS OR LINKS)
 # ==============================================================================
-# Direct workers.dev edge domain is used as the default to prevent datacenter Cloudflare WAF/Turnstile challenges
-EDGE_API_ORIGIN = os.environ.get("EDGE_API_ORIGIN", "https://courses-backend.midodo966.workers.dev")
-ADMIN_KEY = os.environ.get("ADMIN_KEY", "azlearn_adm_sec_9f8b7c6d5e4a3b2c1d0e9f8a7b6c5d4e")
+# All endpoints, keys, credentials, and tenant parameters are read strictly from
+# the execution environment (fed dynamically via Cloudflare Worker / GitHub Actions).
+EDGE_API_ORIGIN = os.environ.get("EDGE_API_ORIGIN", "").rstrip("/")
+CLOUDFLARE_API_URL = os.environ.get("CLOUDFLARE_API_URL", "").rstrip("/")
+ADMIN_KEY = os.environ.get("ADMIN_KEY", "").strip()
 
-R2_ACCOUNT_ID = os.environ.get("R2_ACCOUNT_ID", "e7e407d343739d728e23cf0e0f815c87")
-R2_ACCESS_KEY_ID = os.environ.get("R2_ACCESS_KEY_ID", "a8054551b4797c7ddfa2f9c6415a9e02")
-R2_SECRET_ACCESS_KEY = os.environ.get("R2_SECRET_ACCESS_KEY", "bb3f5a77be861ed9a34e6f995a684cac244f0f392139f7fd459acf5f8e1ddc37")
+R2_ACCOUNT_ID = os.environ.get("R2_ACCOUNT_ID", "").strip()
+R2_ACCESS_KEY_ID = os.environ.get("R2_ACCESS_KEY_ID", "").strip()
+R2_SECRET_ACCESS_KEY = os.environ.get("R2_SECRET_ACCESS_KEY", "").strip()
+R2_BUCKET_NAME = os.environ.get("R2_BUCKET_NAME", "").strip()
+KEY_GATEWAY_URL = os.environ.get("KEY_GATEWAY_URL", "").rstrip("/")
 
-# Active tenant state (default: AZ Learn)
-CURRENT_BRAND = "az"
-CLOUDFLARE_API_URL = f"{EDGE_API_ORIGIN}/AZ"
-R2_BUCKET_NAME = "az-bucket"
-KEY_GATEWAY_URL = "https://api.medhub-academy.stream/AZ"
+GDRIVE_SERVICE_ACCOUNT_JSON = os.environ.get("GDRIVE_SERVICE_ACCOUNT_JSON", "").strip()
 
-# Local fallback path for Google Service Account credentials
-LOCAL_GDRIVE_KEY_PATH = "/home/midododo/Downloads/sodium-ray-508905-a4-bf28edccfcde.json"
-GDRIVE_SERVICE_ACCOUNT_JSON = os.environ.get("GDRIVE_SERVICE_ACCOUNT_JSON", "")
+# Active tenant state
+CURRENT_BRAND = os.environ.get("CURRENT_BRAND", "az").lower()
 
 # Standardized Video Encoding Parameters (from 1_encrypt_and_upload_aio.py)
 TARGET_WIDTH = 1280
@@ -108,7 +104,6 @@ CRF_QUALITY = 20                # Near-lossless visual quality for educational t
 # ==============================================================================
 api_session = requests.Session()
 api_session.headers.update({
-    "Authorization": f"Bearer {ADMIN_KEY}",
     "Content-Type": "application/json",
     "User-Agent": "AZLearn-Transcoder-Engine/2.0 (Ubuntu; Linux x86_64; Automated Edge Pipeline)"
 })
@@ -116,7 +111,7 @@ api_session.headers.update({
 def configure_brand(brand):
     """
     Dynamically adjusts API base, R2 bucket, and key gateway URL for multi-tenant deployments.
-    Ensures 100% brand isolation between AZ Learn and All In One.
+    Derives all parameters dynamically with ZERO hardcoded URLs, domains, or secrets.
     """
     global CURRENT_BRAND, CLOUDFLARE_API_URL, R2_BUCKET_NAME, KEY_GATEWAY_URL
     b = (brand or "az").lower()
@@ -124,34 +119,49 @@ def configure_brand(brand):
         b = "az"
     CURRENT_BRAND = b
 
-    if b == "aio":
-        CLOUDFLARE_API_URL = f"{EDGE_API_ORIGIN}/AIO"
-        R2_BUCKET_NAME = "aio-bucket"
-        KEY_GATEWAY_URL = "https://api.medhub-academy.stream/AIO"
-    else:
-        CLOUDFLARE_API_URL = f"{EDGE_API_ORIGIN}/AZ"
-        R2_BUCKET_NAME = "az-bucket"
-        KEY_GATEWAY_URL = "https://api.medhub-academy.stream/AZ"
+    # If EDGE_API_ORIGIN is present, derive tenant API endpoint
+    if EDGE_API_ORIGIN:
+        CLOUDFLARE_API_URL = f"{EDGE_API_ORIGIN}/{b.upper()}"
+    elif not CLOUDFLARE_API_URL:
+        CLOUDFLARE_API_URL = ""
+
+    # Derive bucket dynamically if not explicitly specified in environment
+    if not os.environ.get("R2_BUCKET_NAME"):
+        R2_BUCKET_NAME = f"{b}-bucket"
+
+    # Derive key gateway URL dynamically if not explicitly specified in environment
+    if not os.environ.get("KEY_GATEWAY_URL"):
+        KEY_GATEWAY_URL = CLOUDFLARE_API_URL
 
 def api_call(method, url, **kwargs):
+    """Executes an API request against the configured Cloudflare Worker endpoint."""
+    return api_session.request(method, url, timeout=kwargs.pop("timeout", 20), **kwargs)
+
+def validate_environment():
     """
-    Executes an API request against Cloudflare Worker.
-    Features automatic edge fallback: if a custom domain request triggers a Cloudflare WAF/Turnstile
-    bot challenge (HTTP 403 'Just a moment...'), it immediately swaps host to direct workers.dev.
+    Strict fail-fast validation: ensures all required credentials and endpoints
+    have been provided via environment variables before running any processing logic.
     """
-    try:
-        resp = api_session.request(method, url, timeout=kwargs.pop("timeout", 20), **kwargs)
-        if resp.status_code == 403 and "Just a moment..." in resp.text and "api.medhub-academy.stream" in url:
-            direct_url = url.replace("api.medhub-academy.stream", "courses-backend.midodo966.workers.dev")
-            print(f"🔄 [Edge Fallback] Custom domain challenged by Cloudflare. Retrying via direct edge: {direct_url}")
-            return api_session.request(method, direct_url, timeout=20, **kwargs)
-        return resp
-    except Exception as e:
-        if "api.medhub-academy.stream" in url:
-            direct_url = url.replace("api.medhub-academy.stream", "courses-backend.midodo966.workers.dev")
-            print(f"🔄 [Edge Fallback] Custom domain error ({e}). Retrying via direct edge: {direct_url}")
-            return api_session.request(method, direct_url, timeout=20, **kwargs)
-        raise e
+    missing = []
+    if not ADMIN_KEY:
+        missing.append("ADMIN_KEY")
+    if not R2_ACCOUNT_ID:
+        missing.append("R2_ACCOUNT_ID")
+    if not R2_ACCESS_KEY_ID:
+        missing.append("R2_ACCESS_KEY_ID")
+    if not R2_SECRET_ACCESS_KEY:
+        missing.append("R2_SECRET_ACCESS_KEY")
+    if not GDRIVE_SERVICE_ACCOUNT_JSON:
+        missing.append("GDRIVE_SERVICE_ACCOUNT_JSON")
+    if not EDGE_API_ORIGIN and not CLOUDFLARE_API_URL:
+        missing.append("EDGE_API_ORIGIN (or CLOUDFLARE_API_URL)")
+
+    if missing:
+        print("❌ [Fatal Error] Transcoder runner missing required environment variables:", file=sys.stderr)
+        for var in missing:
+            print(f"   - {var}", file=sys.stderr)
+        print("Please supply these variables via GitHub Actions secrets or workflow dispatch inputs.", file=sys.stderr)
+        sys.exit(1)
 
 def update_job_progress(job_id, status, progress_percent, error_message=None, duration_seconds=None):
     """Reports execution status to Cloudflare D1 for real-time admin portal telemetry."""
@@ -209,23 +219,14 @@ def check_job_status(job_id):
 # HELPER: GOOGLE DRIVE PRIVATE FILE STREAMER
 # ==============================================================================
 def get_gdrive_service():
-    """Initializes Google Drive API v3 client using Service Account credentials."""
-    creds_dict = None
-    if GDRIVE_SERVICE_ACCOUNT_JSON:
-        try:
-            creds_dict = json.loads(GDRIVE_SERVICE_ACCOUNT_JSON)
-        except Exception as e:
-            print(f"⚠️ Failed to parse GDRIVE_SERVICE_ACCOUNT_JSON env: {e}", file=sys.stderr)
+    """Initializes Google Drive API v3 client using Service Account credentials from environment."""
+    if not GDRIVE_SERVICE_ACCOUNT_JSON:
+        raise RuntimeError("GDRIVE_SERVICE_ACCOUNT_JSON environment variable is missing or empty.")
 
-    if not creds_dict and os.path.exists(LOCAL_GDRIVE_KEY_PATH):
-        try:
-            with open(LOCAL_GDRIVE_KEY_PATH, "r") as f:
-                creds_dict = json.load(f)
-        except Exception as e:
-            print(f"⚠️ Failed to load local service account file: {e}", file=sys.stderr)
-
-    if not creds_dict:
-        raise RuntimeError("Google Drive Service Account credentials not provided (missing env & local fallback).")
+    try:
+        creds_dict = json.loads(GDRIVE_SERVICE_ACCOUNT_JSON)
+    except Exception as e:
+        raise RuntimeError(f"Failed to parse GDRIVE_SERVICE_ACCOUNT_JSON as valid JSON: {e}")
 
     credentials = service_account.Credentials.from_service_account_info(
         creds_dict,
@@ -329,6 +330,43 @@ def count_pdf_pages(pdf_path):
     except Exception:
         return 0
 
+def encrypt_and_upload_pdf(raw_pdf_path, resource_uuid, s3_client, bucket_name):
+    """
+    Encrypts a raw PDF document using AES-128-CBC with PKCS7 padding and a 16-byte prepended IV (SEC-05 standard).
+    Uploads the encrypted payload to Cloudflare R2 as {resource_uuid}.enc and returns (key_base64, page_count).
+    
+    Security & Parity Rationale:
+    Student app (content-v2.js & azpack.js) expects {resourceUuid}.enc and fetches decryption keys from /api/keys/:uuid.
+    Uploading unencrypted .pdf files leaves students unable to decrypt or download offline.
+    """
+    from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+    from cryptography.hazmat.primitives import padding
+
+    with open(raw_pdf_path, "rb") as f:
+        raw_pdf_bytes = f.read()
+
+    raw_key = os.urandom(16)
+    iv = os.urandom(16)
+    padder = padding.PKCS7(128).padder()
+    padded_data = padder.update(raw_pdf_bytes) + padder.finalize()
+    cipher = Cipher(algorithms.AES(raw_key), modes.CBC(iv))
+    encryptor = cipher.encryptor()
+    ciphertext = encryptor.update(padded_data) + encryptor.finalize()
+    combined_payload = iv + ciphertext
+    key_base64 = base64.b64encode(raw_key).decode("utf-8")
+
+    r2_key = f"{resource_uuid}.enc"
+    s3_client.put_object(
+        Bucket=bucket_name,
+        Key=r2_key,
+        Body=combined_payload,
+        ContentType="application/octet-stream",
+        CacheControl="public, max-age=31536000, immutable"
+    )
+
+    page_count = count_pdf_pages(raw_pdf_path)
+    return key_base64, page_count
+
 def detect_optimal_encoder():
     """
     Auto-detects NVIDIA NVENC hardware acceleration for peak throughput GPU encoding.
@@ -375,7 +413,6 @@ def detect_optimal_encoder():
 def transcode_and_slice_720p_4s(input_path, output_dir, resource_uuid):
     """
     Executes atomic single-pass 720p transcoding and slicing into 4.0-second AES-128 HLS chunks.
-    Matches colab-scripts/1_encrypt_and_upload_aio.py production standard.
     Output:
       - playlist.m3u8 (authoritative playlist)
       - chunk_000.ts, chunk_001.ts, ... (4.0s encrypted segments)
@@ -545,26 +582,20 @@ def process_job(job_id):
         download_private_drive_file(drive_service, drive_file_id, str(raw_source_path))
 
         if material_type == "pdf":
-            # PDF Document Pipeline (Zero re-encoding)
+            # PDF Document Pipeline: AES-128-CBC Encryption & Edge R2 Upload (SEC-05 Standard)
             update_job_progress(job_id, "uploading", 60)
-            print(f"📄 [3/5] Ingesting PDF document...")
+            print(f"📄 [3/5] Encrypting and uploading PDF document...")
             s3 = boto3.client(
                 "s3",
                 endpoint_url=f"https://{R2_ACCOUNT_ID}.r2.cloudflarestorage.com",
                 aws_access_key_id=R2_ACCESS_KEY_ID,
                 aws_secret_access_key=R2_SECRET_ACCESS_KEY
             )
-            r2_key = f"{resource_uuid}.pdf"
-            with open(raw_source_path, "rb") as f:
-                s3.put_object(
-                    Bucket=R2_BUCKET_NAME,
-                    Key=r2_key,
-                    Body=f,
-                    ContentType="application/pdf"
-                )
+            key_base64, pdf_page_count = encrypt_and_upload_pdf(
+                raw_source_path, resource_uuid, s3, R2_BUCKET_NAME
+            )
 
-            pdf_page_count = count_pdf_pages(raw_source_path)
-            # Register in D1 materials
+            # Register in D1 materials and vault AES key atomically in video_keys
             ingest_payload = {
                 "course_id": job["course_id"],
                 "course_title": job["course_title"],
@@ -574,6 +605,7 @@ def process_job(job_id):
                 "material_title": Path(file_name).stem,
                 "material_type": "pdf",
                 "resource_uuid": resource_uuid,
+                "key_base64": key_base64,
                 "order_index": job.get("order_index") or 999,
                 "provider_name": job.get("provider_name"),
                 "page_count": pdf_page_count
@@ -583,7 +615,7 @@ def process_job(job_id):
                 raise RuntimeError(f"Failed to register PDF in D1: {resp.text}")
 
             update_job_progress(job_id, "completed", 100)
-            print(f"✅ [5/5] PDF material published successfully to [{CURRENT_BRAND.upper()}].")
+            print(f"✅ [5/5] Encrypted PDF material published successfully to [{CURRENT_BRAND.upper()}].")
 
         else:
             # Video Pipeline: Optimized Stream Encoding & Secure Slicing
@@ -697,8 +729,16 @@ def main():
     parser.add_argument("--brand", choices=["az", "aio", "both"], default=None, help="Target tenant brand (default: az)")
     args = parser.parse_args()
 
+    # Fail fast if required runtime environment variables are not provisioned
+    validate_environment()
+
+    # Initialize authenticated session
+    api_session.headers["Authorization"] = f"Bearer {ADMIN_KEY}"
+
     if args.brand and args.brand != "both":
         configure_brand(args.brand)
+    else:
+        configure_brand(CURRENT_BRAND)
 
     if args.job_id:
         try:

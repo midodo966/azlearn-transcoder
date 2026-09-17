@@ -13,6 +13,26 @@ on:
         required: false
         type: string
         default: 'both'
+      edge_api_origin:
+        description: 'Edge Worker Origin URL'
+        required: false
+        type: string
+        default: ''
+      cloudflare_api_url:
+        description: 'Target Cloudflare API Endpoint'
+        required: false
+        type: string
+        default: ''
+      key_gateway_url:
+        description: 'HLS AES-128 Key Gateway Base URL'
+        required: false
+        type: string
+        default: ''
+      r2_bucket_name:
+        description: 'Target Cloudflare R2 Bucket Name'
+        required: false
+        type: string
+        default: ''
 
 concurrency:
   group: transcode-${{ inputs.job_id != '' && inputs.job_id || 'batch' }}
@@ -46,12 +66,14 @@ jobs:
 
       - name: 5. Execute Transcoding Pipeline
         env:
-          CLOUDFLARE_API_URL: ${{ secrets.CLOUDFLARE_API_URL || 'https://courses-backend.midodo966.workers.dev/AZ' }}
+          EDGE_API_ORIGIN: ${{ inputs.edge_api_origin || secrets.EDGE_API_ORIGIN }}
+          CLOUDFLARE_API_URL: ${{ inputs.cloudflare_api_url || secrets.CLOUDFLARE_API_URL }}
+          KEY_GATEWAY_URL: ${{ inputs.key_gateway_url || secrets.KEY_GATEWAY_URL }}
           ADMIN_KEY: ${{ secrets.ADMIN_KEY }}
           R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
           R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
           R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
-          R2_BUCKET_NAME: ${{ secrets.R2_BUCKET_NAME || 'az-bucket' }}
+          R2_BUCKET_NAME: ${{ inputs.r2_bucket_name || secrets.R2_BUCKET_NAME }}
           GDRIVE_SERVICE_ACCOUNT_JSON: ${{ secrets.GDRIVE_SERVICE_ACCOUNT_JSON }}
         run: |
           if [ -n "${{ inputs.job_id }}" ]; then
