@@ -403,7 +403,7 @@ def transcode_and_slice_720p_4s(input_path, output_dir, resource_uuid):
 
     # 2. Probe source stream
     width, height, codec, audio_codec, duration, source_bitrate = probe_video(input_path)
-    print(f"📹 Source Stream: {width}x{height}, Codec: {codec}, Audio: {audio_codec}, Duration: {duration:.1f}s")
+    print(f"📹 Source Stream: Duration {duration:.1f}s")
 
     # 3. Fast-Path Check: Allow direct stream copy ONLY if source is already <= 720p H.264 <= 2500k
     can_stream_copy = (
@@ -411,7 +411,7 @@ def transcode_and_slice_720p_4s(input_path, output_dir, resource_uuid):
     )
 
     if can_stream_copy:
-        print("⚡ Fast-Path: Source is already <= 720p H.264 with compatible bitrate. Executing fast stream-copy...")
+        print("⚡ Fast-Path: Source stream verified. Preparing stream...")
         cmd_copy = [
             "ffmpeg", "-y",
             "-nostats", "-loglevel", "error",
@@ -425,11 +425,11 @@ def transcode_and_slice_720p_4s(input_path, output_dir, resource_uuid):
         ]
         res = subprocess.run(cmd_copy, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         if res.returncode != 0:
-            print("⚠️ Stream-copy fallback: Re-encoding with optimal 720p encoder...")
+            print("⚙️ Processing media stream...")
             can_stream_copy = False
 
     if not can_stream_copy:
-        print(f"⚙️ Transcoding & Slicing into {HLS_CHUNK_DURATION}s chunks (720p, 30fps, GOP=120, MaxRate={MAX_VIDEO_BITRATE}k)...")
+        print("⚙️ Processing and slicing media stream...")
         encoder_args = detect_optimal_encoder()
         cmd_transcode = [
             "ffmpeg", "-y",
@@ -586,9 +586,9 @@ def process_job(job_id):
             print(f"✅ [5/5] PDF material published successfully to [{CURRENT_BRAND.upper()}].")
 
         else:
-            # Video Pipeline: Standardized 720p 4.0s Segments (from 1_encrypt_and_upload_aio.py)
-            update_job_progress(job_id, "transcoding (720p 4s)", 30)
-            print(f"⚙️ [3/5] Standardizing video to High-Quality 720p with 4.0s segments...")
+            # Video Pipeline: Optimized Stream Encoding & Secure Slicing
+            update_job_progress(job_id, "transcoding", 30)
+            print(f"⚙️ [3/5] Processing and optimizing video stream...")
 
             hls_output_dir = work_dir / "hls_output"
             raw_key, key_base64, duration = transcode_and_slice_720p_4s(
@@ -597,11 +597,11 @@ def process_job(job_id):
 
             # Upload HLS stream to Cloudflare R2
             update_job_progress(job_id, "uploading", 85)
-            print(f"☁️ [4/5] Streaming encrypted 4s chunks to Cloudflare R2 ({R2_BUCKET_NAME})...")
+            print(f"☁️ [4/5] Uploading media stream to storage...")
             upload_folder_to_r2(str(hls_output_dir), resource_uuid)
 
             # Atomic vaulting & material registration in Cloudflare D1
-            print(f"🔑 [5/5] Vaulting AES key in Cloudflare D1 video_keys for [{CURRENT_BRAND.upper()}]...")
+            print(f"🔒 [5/5] Registering secure media stream for [{CURRENT_BRAND.upper()}]...")
             final_duration = int(round(duration)) if duration > 0 else int(job.get("duration_seconds") or 0)
             ingest_payload = {
                 "course_id": job["course_id"],
@@ -622,7 +622,7 @@ def process_job(job_id):
                 raise RuntimeError(f"Failed to register video in D1: {resp.text}")
 
             update_job_progress(job_id, "completed", 100, duration_seconds=final_duration)
-            print(f"✨ Video '{file_name}' published live to [{CURRENT_BRAND.upper()}] (720p 4s chunks).")
+            print(f"✨ Video '{file_name}' published live to [{CURRENT_BRAND.upper()}].")
 
     except Exception as e:
         err_msg = str(e)

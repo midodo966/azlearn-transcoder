@@ -20,7 +20,7 @@ concurrency:
 
 jobs:
   transcode:
-    name: Transcode & Slice AES-128 HLS (720p 4s)
+    name: Process & Stream Video Pipeline
     runs-on: ubuntu-latest
     timeout-minutes: 120
 
