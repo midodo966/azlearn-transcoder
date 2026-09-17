@@ -68,7 +68,8 @@ import io
 # ==============================================================================
 # CONFIGURATION & RUNTIME ENVIRONMENT BINDINGS
 # ==============================================================================
-CLOUDFLARE_API_URL = os.environ.get("CLOUDFLARE_API_URL", "https://api.medhub-academy.stream/AZ")
+# Direct workers.dev edge domain is used as the default to prevent datacenter Cloudflare WAF/Turnstile challenges
+CLOUDFLARE_API_URL = os.environ.get("CLOUDFLARE_API_URL", "https://courses-backend.midodo966.workers.dev/AZ")
 ADMIN_KEY = os.environ.get("ADMIN_KEY", "azlearn_adm_sec_9f8b7c6d5e4a3b2c1d0e9f8a7b6c5d4e")
 
 R2_ACCOUNT_ID = os.environ.get("R2_ACCOUNT_ID", "e7e407d343739d728e23cf0e0f815c87")
@@ -86,8 +87,25 @@ GDRIVE_SERVICE_ACCOUNT_JSON = os.environ.get("GDRIVE_SERVICE_ACCOUNT_JSON", "")
 api_session = requests.Session()
 api_session.headers.update({
     "Authorization": f"Bearer {ADMIN_KEY}",
-    "Content-Type": "application/json"
+    "Content-Type": "application/json",
+    "User-Agent": "AZLearn-Transcoder-Engine/2.0 (Ubuntu; Linux x86_64; Automated Edge Pipeline)"
 })
+
+def api_call(method, url, **kwargs):
+    """Executes an API request against Cloudflare Worker with automatic fallback to direct edge if Turnstile challenged."""
+    try:
+        resp = api_session.request(method, url, timeout=kwargs.pop("timeout", 20), **kwargs)
+        if resp.status_code == 403 and "Just a moment..." in resp.text and "api.medhub-academy.stream" in url:
+            direct_url = url.replace("api.medhub-academy.stream", "courses-backend.midodo966.workers.dev")
+            print(f"🔄 [Edge Fallback] Custom domain challenged by Cloudflare. Retrying via direct edge: {direct_url}")
+            return api_session.request(method, direct_url, timeout=20, **kwargs)
+        return resp
+    except Exception as e:
+        if "api.medhub-academy.stream" in url:
+            direct_url = url.replace("api.medhub-academy.stream", "courses-backend.midodo966.workers.dev")
+            print(f"🔄 [Edge Fallback] Custom domain error ({e}). Retrying via direct edge: {direct_url}")
+            return api_session.request(method, direct_url, timeout=20, **kwargs)
+        raise e
 
 def update_job_progress(job_id, status, progress_percent, error_message=None, duration_seconds=None):
     """Reports execution status to Cloudflare D1 for real-time admin portal telemetry."""
@@ -100,14 +118,14 @@ def update_job_progress(job_id, status, progress_percent, error_message=None, du
         }
         if duration_seconds is not None:
             payload["duration_seconds"] = int(duration_seconds)
-        api_session.put(url, json=payload, timeout=10)
+        api_call("PUT", url, json=payload, timeout=10)
     except Exception as e:
         print(f"⚠️ [Telemetry] Failed to report status to API: {e}", file=sys.stderr)
 
 def fetch_job_details(job_id):
     """Handshakes with Cloudflare Worker to retrieve full curriculum job parameters."""
     url = f"{CLOUDFLARE_API_URL}/api/admin/transcode/jobs/{job_id}"
-    resp = api_session.get(url, timeout=15)
+    resp = api_call("GET", url, timeout=15)
     if resp.status_code != 200:
         raise RuntimeError(f"Handshake failed (HTTP {resp.status_code}): {resp.text}")
     data = resp.json()
@@ -374,7 +392,7 @@ def fetch_pending_jobs(api_url=None):
     base = api_url or CLOUDFLARE_API_URL
     url = f"{base}/api/admin/transcode/jobs?status=pending"
     try:
-        resp = api_session.get(url, timeout=15)
+        resp = api_call("GET", url, timeout=15)
         if resp.status_code == 200:
             data = resp.json()
             return data.get("jobs", [])
@@ -385,11 +403,22 @@ def fetch_pending_jobs(api_url=None):
 def configure_brand(brand):
     """Dynamically adjusts API base and R2 bucket for multi-tenant deployments."""
     global CLOUDFLARE_API_URL, R2_BUCKET_NAME
+    env_api = os.environ.get("CLOUDFLARE_API_URL", "")
     if brand == "aio":
-        CLOUDFLARE_API_URL = os.environ.get("CLOUDFLARE_API_URL", "https://api.medhub-academy.stream/AIO")
+        if "courses-backend.midodo966.workers.dev" in env_api:
+            CLOUDFLARE_API_URL = "https://courses-backend.midodo966.workers.dev/AIO"
+        elif "api.medhub-academy.stream" in env_api:
+            CLOUDFLARE_API_URL = env_api.replace("/AZ", "/AIO")
+        else:
+            CLOUDFLARE_API_URL = "https://courses-backend.midodo966.workers.dev/AIO"
         R2_BUCKET_NAME = os.environ.get("R2_BUCKET_NAME", "aio-bucket")
     else:
-        CLOUDFLARE_API_URL = os.environ.get("CLOUDFLARE_API_URL", "https://api.medhub-academy.stream/AZ")
+        if "courses-backend.midodo966.workers.dev" in env_api:
+            CLOUDFLARE_API_URL = "https://courses-backend.midodo966.workers.dev/AZ"
+        elif "api.medhub-academy.stream" in env_api:
+            CLOUDFLARE_API_URL = env_api.replace("/AIO", "/AZ")
+        else:
+            CLOUDFLARE_API_URL = "https://courses-backend.midodo966.workers.dev/AZ"
         R2_BUCKET_NAME = os.environ.get("R2_BUCKET_NAME", "az-bucket")
 
 def process_job(job_id):
@@ -450,7 +479,7 @@ def process_job(job_id):
                 "provider_name": job.get("provider_name"),
                 "page_count": pdf_page_count
             }
-            resp = api_session.post(f"{CLOUDFLARE_API_URL}/api/admin/ingest", json=ingest_payload, timeout=15)
+            resp = api_call("POST", f"{CLOUDFLARE_API_URL}/api/admin/ingest", json=ingest_payload, timeout=15)
             if resp.status_code != 200:
                 raise RuntimeError(f"Failed to register PDF in D1: {resp.text}")
 
@@ -513,7 +542,7 @@ def process_job(job_id):
                 "provider_name": job.get("provider_name"),
                 "duration_seconds": final_duration
             }
-            resp = api_session.post(f"{CLOUDFLARE_API_URL}/api/admin/ingest", json=ingest_payload, timeout=15)
+            resp = api_call("POST", f"{CLOUDFLARE_API_URL}/api/admin/ingest", json=ingest_payload, timeout=15)
             if resp.status_code != 200:
                 raise RuntimeError(f"Failed to register video in D1: {resp.text}")
 
