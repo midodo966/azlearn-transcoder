@@ -174,7 +174,9 @@ def update_job_progress(job_id, status, progress_percent, error_message=None, du
         }
         if duration_seconds is not None:
             payload["duration_seconds"] = int(duration_seconds)
-        api_call("PUT", url, json=payload, timeout=10)
+        resp = api_call("PUT", url, json=payload, timeout=10)
+        if resp.status_code != 200:
+            print(f"⚠️ [Telemetry] Progress update returned HTTP {resp.status_code}: {resp.text[:200]}", file=sys.stderr)
     except Exception as e:
         print(f"⚠️ [Telemetry] Failed to report status to API: {e}", file=sys.stderr)
 
@@ -193,6 +195,8 @@ def fetch_job_details(job_id):
         data = resp.json()
         if data.get("success") and data.get("job"):
             return data["job"]
+    else:
+        print(f"ℹ️ [Handshake] Probe for {CURRENT_BRAND.upper()} ({url}) returned HTTP {resp.status_code}: {resp.text[:200]}", file=sys.stderr)
 
     # 2. Cross-brand fallback: probe alternate brand
     alt_brand = "aio" if CURRENT_BRAND == "az" else "az"
@@ -204,6 +208,8 @@ def fetch_job_details(job_id):
             print(f"🔄 [Multi-Brand] Job {job_id} discovered under {alt_brand.upper()} tenant. Switching brand context...")
             configure_brand(alt_brand)
             return alt_data["job"]
+    else:
+        print(f"ℹ️ [Handshake] Alt probe for {alt_brand.upper()} ({alt_url}) returned HTTP {alt_resp.status_code}: {alt_resp.text[:200]}", file=sys.stderr)
 
     raise RuntimeError(f"Job {job_id} not found across any brand (checked AZ and AIO).")
 
